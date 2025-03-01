@@ -1,3 +1,6 @@
+# Generative Adversarial Network for Atari Images (with PyTorch Ignite)
+# Credit: "Deep Reinforcement Learning Hands-On" by Maxim Lapan
+
 import cv2
 import time
 import random
@@ -37,6 +40,9 @@ REPORT_EVERY_ITER = 100
 SAVE_IMAGE_EVERY_ITER = 1000
 
 class InputWrapper(gym.ObservationWrapper):
+    """
+    Preprocess input into shape (3, IMAGE_SIZE, IMAGE_SIZE)
+    """
     def __init__(self, *args):
         super(InputWrapper, self).__init__(*args)
         old_space = self.observation_space
@@ -52,6 +58,9 @@ class InputWrapper(gym.ObservationWrapper):
         return new_obs.astype(np.float32)
 
 class Discriminator(nn.Module):
+    """
+    Discriminator learns to distinguish between real and fake images
+    """
     def __init__(self, input_shape):
         super(Discriminator, self).__init__()
         
@@ -81,6 +90,9 @@ class Discriminator(nn.Module):
         return conv_out.view(-1, 1).squeeze(dim=1)
 
 class Generator(nn.Module):
+    """
+    Generator learns to create images that fool the Discriminator
+    """
     def __init__(self, output_shape):
         super(Generator, self).__init__()
     
@@ -114,6 +126,13 @@ class Generator(nn.Module):
         return self.pipe(x)
 
 def process_batch(trainer, batch):
+    """
+    For each batch of real images:
+    1. Generate image from normalized latent vector
+    2. Train Discriminator based on batch data and generated data
+    3. Train Generator based on BCE between Discriminator results
+       and real labels (1s) vs fake labels (0s)
+    """
     gen_input_v = torch.FloatTensor(BATCH_SIZE, LATENT_VECTOR_SIZE, 1, 1)
     gen_input_v.normal_(0, 1)
     gen_input_v = gen_input_v.to(device)
@@ -123,12 +142,16 @@ def process_batch(trainer, batch):
     dis_optimizer.zero_grad()
     dis_output_true_v = net_discr(batch_v)
     dis_output_fake_v = net_discr(gen_output_v.detach())
+
+    # Measure loss from both true and fake images
     dis_loss = objective(dis_output_true_v, true_labels_v) + \
                objective(dis_output_fake_v, fake_labels_v)
     dis_loss.backward()
 
     gen_optimizer.zero_grad()
     dis_output_v = net_discr(gen_output_v)
+
+    # Train Generator on Discriminator output
     gen_loss = objective(dis_output_v, true_labels_v)
     gen_loss.backward()
     gen_optimizer.step()
@@ -142,17 +165,25 @@ def process_batch(trainer, batch):
     return dis_loss.item(), gen_loss.item()
 
 def iterate_batches(envs: tt.List[gym.Env],
-                    batch_size: int = BATCH_SIZE) -> tt.Generator[torch.Tensor, None, None]:
+                    batch_size: int = BATCH_SIZE) \
+        -> tt.Generator[torch.Tensor, None, None]:
+    # Store observations in periodically cleared batch,
+    # ensuring that the environment is reset before use
     batch = [e.reset()[0] for e in envs]
+
+    # Sample the environment
     env_gen = iter(lambda: random.choice(envs), None)
     
     while True:
         e = next(env_gen)
         action = e.action_space.sample()
+
+        # Step through one action
         obs, reward, is_done, is_trunc, _ = e.step(action)
         if np.mean(obs) > 0.01:
             batch.append(obs)
         if len(batch) == batch_size:
+            # Return batch
             batch_np = np.array(batch, dtype=np.float32)
             yield torch.tensor(batch_np * 2.0 / 255.0 - 1.0)
             batch.clear()
@@ -160,6 +191,7 @@ def iterate_batches(envs: tt.List[gym.Env],
             e.reset()
 
 if __name__ == "__main__":
+    # Specify the device to run on as a command line argument
     parser = argparse.ArgumentParser()
     parser.add_argument("--dev", default="cpu", help="Device name, default=cpu")
     args = parser.parse_args()
@@ -171,9 +203,11 @@ if __name__ == "__main__":
     ]
     shape = envs[0].observation_space.shape
 
+    # Initialize modules to device
     net_discr = Discriminator(input_shape=shape).to(device)
     net_gener = Generator(output_shape=shape).to(device)
 
+    # Binary cross-entropy loss
     objective = nn.BCELoss()
     gen_optimizer = optim.Adam(params=net_gener.parameters(),
                                lr=LEARNING_RATE,
@@ -183,23 +217,32 @@ if __name__ == "__main__":
                                lr=LEARNING_RATE,
                                betas=(0.5, 0.999))
     
+    # Tensorboard logging
     writer = SummaryWriter()
 
     gen_losses = []
     dis_losses = []
+
+    # Index
     iter_no = 0
     
+    # 1s are true images and 0s are fake
     true_labels_v = torch.ones(BATCH_SIZE, device=device)
     fake_labels_v = torch.zeros(BATCH_SIZE, device=device)
 
+    # Initialize PyTorch Ignite
+    # Run `process_batch` for each batch; events to be handled
     engine = Engine(process_batch)
     tb = tb_logger.TensorboardLogger(log_dir=None)
     engine.tb = tb
-    RunningAverage(output_transform=lambda out: out[1]).\
-        attach(engine, "avg_loss_gen")
-    RunningAverage(output_transform=lambda out: out[0]).\
-        attach(engine, "avg_loss_dis")
+
+    # Average loss metrics
+    RunningAverage(output_transform=lambda out: out[1]) \
+        .attach(engine, "avg_loss_gen")
+    RunningAverage(output_transform=lambda out: out[0]) \
+        .attach(engine, "avg_loss_dis")
     
+    # Tensorboard logger for these metrics
     handler = tb_logger.OutputHandler(tag="train", metric_names=[
         'avg_loss_gen', 'avg_loss_dis'])
     
@@ -207,6 +250,7 @@ if __name__ == "__main__":
     timer = Timer()
     timer.attach(engine)
 
+    # Log metrics for every `REPORT_EVERY_ITER`th completed iteration
     @engine.on(Events.ITERATION_COMPLETED)
     def log_losses(trainer):
         if trainer.state.iteration % REPORT_EVERY_ITER == 0:
@@ -216,4 +260,5 @@ if __name__ == "__main__":
                      trainer.state.metrics['avg_loss_dis'])
             timer.reset()
 
+    # Begin training
     engine.run(data=iterate_batches(envs))
